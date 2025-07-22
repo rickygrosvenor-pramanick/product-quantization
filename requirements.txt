@@ -1,6 +1,10 @@
 numpy>=1.21.0
 scikit-learn>=1.0.0
 hnswlib>=0.7.0
+
+# Embedding model
+cohere>=4.21.0
+
 matplotlib>=3.5.0
 seaborn>=0.11.0
 tqdm>=4.64.0
