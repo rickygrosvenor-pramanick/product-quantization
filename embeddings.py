@@ -14,6 +14,10 @@ import os
 import random
 from typing import List, Optional
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class EmbeddingGenerator:

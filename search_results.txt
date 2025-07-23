@@ -1,0 +1,21 @@
+Search Results
+==================================================
+
+Query: Ahlstrom Corporation STOCK EXCHANGE ANNOUNCEMENT
+------------------------------
+1.030289	down to EUR5 .9 m H1 '09 3 August 2009 - Finnish media group Ilkka-Yhtyma Oyj ( HEL : ILK2S ) said today its net profit fell 45 % on the year to EUR5 .9 m in the first half of 2009 .
+1.030820	Kesko has previously published a stock exchange release concerning the deal on 7 February 2007 .
+1.042523	Johnson Matthey raises prospect of investor payout
+
+Query: Hello
+------------------------------
+1.018619	GSK joins China trade push as UK trumpets healthcare deals
+1.034805	Capitex Kalmar will continue to be responsible for the maintenance and technical development of the services .
+1.038782	Cash flow from operations totalled EUR 2.71 mn , compared to a negative EUR 0.83 mn in the corresponding period in 2008 .
+
+Query: UK
+------------------------------
+1.029703	Of this , EUR 38.8 mn was net interest income .
+1.033699	AstraZeneca's MedImmune Inks Licensing Deal With Omnis Pharmaceuticals
+1.034829	The ground barleycorn has been fully produced in Finland and will be available in stores as of the beginning of 2010 .
+
