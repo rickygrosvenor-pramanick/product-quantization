@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PQ module tests
+        run: python -m pytest tests/ -v
+
+      - name: Run PQ smoke test
+        env:
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+        run: python -c "
+          from pq import ProductQuantizer, PQIndex, generate_random_embeddings
+          import numpy as np
+
+          embeddings = generate_random_embeddings(500, 384)
+          pq = ProductQuantizer(M=8, K=256)
+          pq.fit(embeddings)
+          codes = pq.encode(embeddings)
+          reconstructed = pq.decode(codes)
+          mse = float(np.mean((embeddings - reconstructed) ** 2))
+          assert mse < 0.01, f'Reconstruction MSE too high: {mse}'
+
+          index = PQIndex(pq, max_elements=1000)
+          index.add_vectors(embeddings)
+          dists, ids = index.search(embeddings[0], k=5)
+          assert len(ids) == 5
+          assert ids[0] == 0, 'Self-search should return query as top result'
+
+          print(f'All checks passed (MSE={mse:.6f})')
+          "

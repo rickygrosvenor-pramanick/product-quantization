@@ -22,8 +22,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import our modules
-from embeddings import EmbeddingGenerator, save_embeddings, load_embeddings
 from pq import ProductQuantizer, brute_force_search
+
+try:
+    from embeddings import EmbeddingGenerator, save_embeddings, load_embeddings
+except ImportError:
+    EmbeddingGenerator = None
+    save_embeddings = None
+    load_embeddings = None
 
 
 class DataProcessor:
@@ -149,167 +155,146 @@ class DataProcessor:
 
 class SimpleRetrievalSystem:
     """
-    Simple retrieval system using Product Quantization without a vector database.
-    
-    This system stores PQ codes in memory and uses asymmetric distance computation
-    for fast similarity search.
+    Retrieval system using Product Quantization without a vector database.
+
+    Supports two search paths:
+      1. **PQ-only** (default): asymmetric distance over all PQ codes — no
+         external index needed, works well up to ~100k documents.
+      2. **Re-ranked**: shortlist via PQ, then re-rank with exact L2 distances
+         against the stored original embeddings for higher precision.
     """
-    
+
     def __init__(self, M: int = 8, K: int = 256):
-        """
-        Initialize retrieval system.
-        
-        Args:
-            M (int): Number of sub-spaces for PQ
-            K (int): Number of centroids per codebook
-        """
         self.M = M
         self.K = K
         self.pq = ProductQuantizer(M=M, K=K, verbose=True)
-        
-        # Storage for the retrieval system
-        self.codes = None  # PQ codes for all documents
-        self.texts = None  # Original text documents
-        self.metadata = None  # Document metadata (sentiments, etc.)
-        self.original_embeddings = None  # Keep original embeddings for evaluation
-        
+
+        self.codes = None
+        self.texts = None
+        self.metadata = None
+        self.original_embeddings = None
+
     def train_quantizer(self, embeddings: np.ndarray) -> None:
-        """
-        Train the Product Quantizer on the embeddings.
-        
-        Args:
-            embeddings (np.ndarray): Training embeddings of shape (N, D)
-        """
         print(f"\nTraining Product Quantizer with M={self.M}, K={self.K}...")
         print(f"Input embeddings shape: {embeddings.shape}")
-        
-        # Train the quantizer
+
         self.pq.fit(embeddings)
-        
+
         print("Product Quantizer training completed!")
-        
-        # Calculate compression ratio
+
         original_size = embeddings.nbytes
-        code_size = embeddings.shape[0] * self.M * (1 if self.K <= 256 else 2)  # bytes
-        codebook_size = self.M * self.K * (embeddings.shape[1] // self.M) * 4  # float32
+        code_size = embeddings.shape[0] * self.M * (1 if self.K <= 256 else 2)
+        codebook_size = self.M * self.K * (embeddings.shape[1] // self.M) * 4
         total_pq_size = code_size + codebook_size
-        
         compression_ratio = original_size / total_pq_size
-        
+
         print(f"\nCompression Analysis:")
         print(f"Original size: {original_size / 1024 / 1024:.2f} MB")
         print(f"PQ codes size: {code_size / 1024:.2f} KB")
         print(f"Codebooks size: {codebook_size / 1024:.2f} KB")
         print(f"Total PQ size: {total_pq_size / 1024:.2f} KB")
         print(f"Compression ratio: {compression_ratio:.1f}x")
-    
-    def index_documents(self, embeddings: np.ndarray, texts: List[str], 
+
+    def index_documents(self, embeddings: np.ndarray, texts: List[str],
                        metadata: Optional[List] = None) -> None:
-        """
-        Index documents using PQ encoding.
-        
-        Args:
-            embeddings (np.ndarray): Document embeddings
-            texts (List[str]): Document texts
-            metadata (Optional[List]): Document metadata (e.g., sentiments)
-        """
         if not self.pq.is_trained:
             raise RuntimeError("Quantizer must be trained before indexing")
-        
+
         print(f"\nIndexing {len(texts)} documents...")
-        
-        # Encode embeddings to PQ codes
+
         self.codes = self.pq.encode(embeddings)
         self.texts = texts
         self.metadata = metadata
-        self.original_embeddings = embeddings  # Keep for evaluation
-        
+        self.original_embeddings = embeddings
+
+        # Pre-compute the distance table lookup array for fast search
+        self._precompute_lookup()
+
         print(f"Indexed documents with PQ codes shape: {self.codes.shape}")
-        
-        # Memory usage analysis
+
         memory_usage = self.get_memory_usage()
         print(f"\nMemory Usage:")
         for key, value in memory_usage.items():
             print(f"{key}: {value / 1024:.2f} KB")
-    
-    def search(self, query_embedding: np.ndarray, k: int = 10) -> Tuple[List[str], List[float], List]:
+
+    def _precompute_lookup(self) -> None:
+        """Build a flat int array of codes for cache-friendly distance lookup."""
+        if self.codes is not None:
+            self._codes_int = self.codes.astype(np.intp)
+
+    def search(self, query_embedding: np.ndarray, k: int = 10,
+               rerank: bool = False, rerank_factor: int = 4,
+               sentiment_filter: Optional[str] = None) -> Tuple[List[str], List[float], List]:
         """
-        Search for similar documents using asymmetric PQ distance.
-        
+        Search for similar documents.
+
         Args:
-            query_embedding (np.ndarray): Query embedding vector
-            k (int): Number of results to return
-            
-        Returns:
-            Tuple[List[str], List[float], List]: (texts, distances, metadata)
+            query_embedding: Query vector of shape (D,)
+            k: Number of results to return
+            rerank: If True, shortlist with PQ then re-rank with exact L2
+            rerank_factor: How many PQ candidates to fetch before re-ranking
+            sentiment_filter: If set, only return documents with this sentiment
         """
         if self.codes is None:
             raise RuntimeError("No documents indexed")
-        
-        # Compute asymmetric distances
-        distances = self.pq.asymmetric_distance(query_embedding, self.codes)
-        
-        # Get top-k results
-        top_k_indices = np.argsort(distances)[:k]
-        
+
+        pq_distances = self.pq.asymmetric_distance(query_embedding, self.codes)
+
+        if sentiment_filter and self.metadata:
+            mask = np.array([m == sentiment_filter for m in self.metadata])
+            pq_distances[~mask] = np.inf
+
+        if rerank and self.original_embeddings is not None:
+            n_candidates = min(k * rerank_factor, len(self.texts))
+            candidate_indices = np.argpartition(pq_distances, n_candidates)[:n_candidates]
+
+            exact_distances = np.linalg.norm(
+                self.original_embeddings[candidate_indices] - query_embedding[np.newaxis, :],
+                axis=1
+            )
+            top_k_local = np.argsort(exact_distances)[:k]
+            top_k_indices = candidate_indices[top_k_local]
+            result_distances = exact_distances[top_k_local].tolist()
+        else:
+            top_k_indices = np.argsort(pq_distances)[:k]
+            result_distances = pq_distances[top_k_indices].tolist()
+
         results_texts = [self.texts[i] for i in top_k_indices]
-        results_distances = distances[top_k_indices].tolist()
         results_metadata = [self.metadata[i] if self.metadata else None for i in top_k_indices]
-        
-        return results_texts, results_distances, results_metadata
-    
-    def search_by_text(self, query_text: str, embedder: EmbeddingGenerator, 
-                      k: int = 10) -> Tuple[List[str], List[float], List]:
-        """
-        Search using a text query (requires embedding the query first).
-        
-        Args:
-            query_text (str): Text query
-            embedder (EmbeddingGenerator): Embedder to convert text to vector
-            k (int): Number of results to return
-            
-        Returns:
-            Tuple[List[str], List[float], List]: (texts, distances, metadata)
-        """
-        # Embed the query text
+
+        return results_texts, result_distances, results_metadata
+
+    def search_by_text(self, query_text: str, embedder: EmbeddingGenerator,
+                      k: int = 10, rerank: bool = False) -> Tuple[List[str], List[float], List]:
         query_embedding = embedder.embed_queries([query_text])[0]
-        
-        return self.search(query_embedding, k)
-    
+        return self.search(query_embedding, k, rerank=rerank)
+
+    def batch_search(self, query_embeddings: np.ndarray, k: int = 10,
+                     rerank: bool = False) -> List[Tuple[List[str], List[float], List]]:
+        """Run search for multiple query vectors at once."""
+        return [self.search(q, k=k, rerank=rerank) for q in query_embeddings]
+
     def evaluate_recall(self, query_embeddings: np.ndarray, k_values: List[int] = [1, 5, 10]) -> Dict[int, float]:
-        """
-        Evaluate recall@K by comparing PQ search with brute force search.
-        
-        Args:
-            query_embeddings (np.ndarray): Query embeddings for evaluation
-            k_values (List[int]): K values to evaluate
-            
-        Returns:
-            Dict[int, float]: Recall@K for each K value
-        """
         if self.original_embeddings is None:
             raise RuntimeError("Original embeddings not available for evaluation")
-        
+
         print(f"\nEvaluating recall with {len(query_embeddings)} queries...")
-        
+
         max_k = max(k_values)
-        
-        # Get ground truth (brute force search)
+
         true_neighbors = []
         for query in tqdm(query_embeddings, desc="Computing ground truth"):
             _, indices = brute_force_search(self.original_embeddings, query.reshape(1, -1), k=max_k)
             true_neighbors.append(indices[0])
         true_neighbors = np.array(true_neighbors)
-        
-        # Get PQ search results
+
         pq_neighbors = []
         for query in tqdm(query_embeddings, desc="PQ search"):
             distances = self.pq.asymmetric_distance(query, self.codes)
             indices = np.argsort(distances)[:max_k]
             pq_neighbors.append(indices)
         pq_neighbors = np.array(pq_neighbors)
-        
-        # Calculate recall@K
+
         recall_results = {}
         for k in k_values:
             recall_sum = 0
@@ -317,29 +302,27 @@ class SimpleRetrievalSystem:
                 true_set = set(true_neighbors[i][:k])
                 pred_set = set(pq_neighbors[i][:k])
                 recall_sum += len(true_set & pred_set) / len(true_set)
-            
+
             recall_results[k] = recall_sum / len(query_embeddings)
             print(f"Recall@{k}: {recall_results[k]:.3f}")
-        
+
         return recall_results
-    
+
     def get_memory_usage(self) -> Dict[str, float]:
-        """Get memory usage statistics."""
         if self.codes is None:
             return {}
-        
+
         usage = {}
         usage['PQ codes'] = self.codes.nbytes
         usage['Text storage'] = sum(len(text.encode('utf-8')) for text in self.texts)
         usage['Codebooks'] = self.pq.codebooks.nbytes if self.pq.codebooks is not None else 0
-        
+
         if self.metadata:
             usage['Metadata'] = sum(len(str(meta).encode('utf-8')) for meta in self.metadata)
-        
+
         return usage
-    
+
     def save_index(self, filepath: str) -> None:
-        """Save the entire retrieval system."""
         data = {
             'pq': self.pq,
             'codes': self.codes,
@@ -348,24 +331,26 @@ class SimpleRetrievalSystem:
             'M': self.M,
             'K': self.K
         }
-        
+
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
-        
+
         print(f"Saved retrieval system to {filepath}")
-    
+
     def load_index(self, filepath: str) -> None:
-        """Load a previously saved retrieval system."""
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
-        
+
         self.pq = data['pq']
         self.codes = data['codes']
         self.texts = data['texts']
         self.metadata = data['metadata']
         self.M = data['M']
         self.K = data['K']
-        
+
+        if self.codes is not None:
+            self._precompute_lookup()
+
         print(f"Loaded retrieval system from {filepath}")
 
 

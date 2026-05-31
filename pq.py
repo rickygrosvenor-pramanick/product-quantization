@@ -14,6 +14,7 @@ Date: July 2025
 """
 
 import numpy as np
+from scipy.spatial.distance import cdist
 from typing import Tuple, Optional, Dict, List, Any
 from sklearn.cluster import KMeans
 import hnswlib
@@ -126,7 +127,7 @@ class ProductQuantizer:
                 max_iter=n_iter,
                 random_state=random_state + m,  # Different seed per sub-space
                 n_init=1,  # Single run since we control random_state
-                algorithm='lloyd'  # Use standard Lloyd's algorithm
+                algorithm='full'
             )
             
             # Fit k-means and store centroids
@@ -185,26 +186,14 @@ class ProductQuantizer:
         
         # Encode each sub-space independently
         for m in range(self.M):
-            # Extract sub-vectors for this sub-space
             start_idx = m * self.sub_dim
             end_idx = (m + 1) * self.sub_dim
-            sub_vectors = embeddings[:, start_idx:end_idx]  # Shape: (N, sub_dim)
-            
-            # Get centroids for this sub-space
-            centroids = self.codebooks[m]  # Shape: (K, sub_dim)
-            
-            # Compute distances from each sub-vector to all centroids
-            # Using broadcasting: (N, 1, sub_dim) - (1, K, sub_dim) = (N, K, sub_dim)
-            distances = np.linalg.norm(
-                sub_vectors[:, np.newaxis, :] - centroids[np.newaxis, :, :], 
-                axis=2
-            )  # Shape: (N, K)
-            
-            # Find nearest centroid for each sub-vector
-            nearest_centroids = np.argmin(distances, axis=1)  # Shape: (N,)
-            
-            # Store the centroid indices as codes
-            codes[:, m] = nearest_centroids.astype(self.code_dtype)
+            sub_vectors = embeddings[:, start_idx:end_idx]
+            centroids = self.codebooks[m]
+
+            # cdist avoids materializing the full (N, K, sub_dim) broadcast tensor
+            distances = cdist(sub_vectors, centroids, metric='euclidean')
+            codes[:, m] = np.argmin(distances, axis=1).astype(self.code_dtype)
         
         if self.verbose:
             # Calculate compression statistics
@@ -448,70 +437,82 @@ class ProductQuantizer:
 class PQIndex:
     """
     Approximate Nearest Neighbor index using Product Quantization.
-    
-    Combines PQ encoding with HNSW for fast similarity search over
-    compressed vectors using asymmetric distance computation.
+
+    Uses HNSW to shortlist candidates on reconstructed PQ vectors,
+    then re-ranks them with asymmetric distance for better accuracy.
     """
-    
-    def __init__(self, pq: ProductQuantizer, max_elements: int = 1000000, 
+
+    def __init__(self, pq: ProductQuantizer, max_elements: int = 1000000,
                  ef_construction: int = 200, M_hnsw: int = 16):
-        """
-        Initialize PQ-based ANN index.
-        
-        Args:
-            pq (ProductQuantizer): Trained product quantizer
-            max_elements (int): Maximum number of vectors to index
-            ef_construction (int): HNSW construction parameter
-            M_hnsw (int): HNSW connectivity parameter
-            
-        Raises:
-            RuntimeError: If product quantizer not trained
-        """
-        pass
-    
+        if not pq.is_trained:
+            raise RuntimeError("Product quantizer must be trained before creating index")
+
+        self.pq = pq
+        self.max_elements = max_elements
+        self.ef_construction = ef_construction
+        self.M_hnsw = M_hnsw
+
+        self.hnsw = hnswlib.Index(space='l2', dim=pq.D)
+        self.hnsw.init_index(
+            max_elements=max_elements,
+            ef_construction=ef_construction,
+            M=M_hnsw
+        )
+
+        self.codes = None
+        self.n_indexed = 0
+
     def add_vectors(self, embeddings: np.ndarray, ids: Optional[np.ndarray] = None) -> None:
-        """
-        Add vectors to the index.
-        
-        Encodes vectors using PQ and adds them to the HNSW index
-        for fast approximate search.
-        
-        Args:
-            embeddings (np.ndarray): Vectors to add, shape (N, D)
-            ids (Optional[np.ndarray]): Optional vector IDs, shape (N,)
-        """
-        pass
-    
+        if embeddings.ndim != 2 or embeddings.shape[1] != self.pq.D:
+            raise ValueError(f"Expected shape (N, {self.pq.D}), got {embeddings.shape}")
+
+        N = embeddings.shape[0]
+        if ids is None:
+            ids = np.arange(self.n_indexed, self.n_indexed + N)
+
+        codes = self.pq.encode(embeddings)
+        reconstructed = self.pq.decode(codes)
+
+        self.hnsw.add_items(reconstructed, ids)
+
+        if self.codes is None:
+            self.codes = codes
+        else:
+            self.codes = np.vstack([self.codes, codes])
+
+        self.n_indexed += N
+
     def search(self, query: np.ndarray, k: int = 10, ef: int = 50) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Search for approximate nearest neighbors.
-        
-        Uses asymmetric distance computation between original query
-        and PQ-encoded database vectors.
-        
-        Args:
-            query (np.ndarray): Query vector of shape (D,)
-            k (int): Number of nearest neighbors to return
-            ef (int): HNSW search parameter
-            
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: (distances, indices) of nearest neighbors
-        """
-        pass
-    
+        if query.ndim != 1:
+            raise ValueError(f"Query must be 1D, got {query.ndim}D")
+
+        self.hnsw.set_ef(ef)
+
+        # Over-fetch candidates, then re-rank with asymmetric PQ distance
+        n_candidates = min(k * 4, self.n_indexed)
+        candidate_ids, _ = self.hnsw.knn_query(query.reshape(1, -1), k=n_candidates)
+        candidate_ids = candidate_ids[0]
+
+        candidate_codes = self.codes[candidate_ids]
+        distances = self.pq.asymmetric_distance(query, candidate_codes)
+
+        top_k = np.argsort(distances)[:k]
+        return distances[top_k], candidate_ids[top_k]
+
     def batch_search(self, queries: np.ndarray, k: int = 10, ef: int = 50) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Batch search for multiple queries.
-        
-        Args:
-            queries (np.ndarray): Query vectors of shape (N_queries, D)
-            k (int): Number of nearest neighbors per query
-            ef (int): HNSW search parameter
-            
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: (distances, indices) for all queries
-        """
-        pass
+        if queries.ndim != 2:
+            raise ValueError(f"Queries must be 2D, got {queries.ndim}D")
+
+        all_distances = np.zeros((len(queries), k), dtype=np.float32)
+        all_indices = np.zeros((len(queries), k), dtype=np.int64)
+
+        for i, query in enumerate(queries):
+            dists, ids = self.search(query, k=k, ef=ef)
+            n_results = len(dists)
+            all_distances[i, :n_results] = dists
+            all_indices[i, :n_results] = ids
+
+        return all_distances, all_indices
 
 
 def generate_random_embeddings(n_vectors: int, dimension: int, 
